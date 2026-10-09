@@ -9,7 +9,8 @@ use ty_python_core::{
 };
 
 use crate::{
-    Db, ProgramEnvironment, attribute_declarations,
+    Db, ProgramEnvironment,
+    lint::LintMetadata,
     place::{DefinedPlace, Place, TypeOrigin},
     types::{
         ClassBase, ClassType, InstanceFallbackShadowsNonDataDescriptor, IntersectionType,
@@ -320,6 +321,17 @@ enum AttributeViolation<'db> {
     ReadOnly,
 }
 
+impl AttributeViolation<'_> {
+    /// Property violations have a dedicated rule, including incompatible writes.
+    const fn rule(&self, involves_property: bool) -> &'static LintMetadata {
+        match self {
+            _ if involves_property => &INVALID_PROPERTY_TYPE_OVERRIDE,
+            Self::Write { .. } => &INVALID_MUTABLE_OVERRIDE,
+            Self::Read { .. } | Self::ReadOnly => &INVALID_ATTRIBUTE_OVERRIDE,
+        }
+    }
+}
+
 /// Find the first read or write that the overriding contract fails to preserve.
 ///
 /// Both contracts are bound to the subclass receiver. `target_receiver` is the base
@@ -478,17 +490,11 @@ pub(super) fn check_override<'db>(
             return false;
         }
     }
-    if already_inherited(db, env, class, superclass, name, &source) {
+    if already_inherited(db, env, class, superclass, name, &source, inherited_kind) {
         return false;
     }
     let involves_property = source.is_property || target.is_property;
-    let rule = if involves_property {
-        &INVALID_PROPERTY_TYPE_OVERRIDE
-    } else if matches!(violation, AttributeViolation::Write { .. }) {
-        &INVALID_MUTABLE_OVERRIDE
-    } else {
-        &INVALID_ATTRIBUTE_OVERRIDE
-    };
+    let rule = violation.rule(involves_property);
     let Some(builder) = context.report_lint(rule, definition.focus_range(db, context.module()))
     else {
         return false;
@@ -564,11 +570,7 @@ pub(super) fn check_instance_overrides<'db>(
         // Ordinary assignments introduce no override contract. Do not infer their method
         // bodies just to discard the inferred type; a lazy cache can depend on its own reads.
         if is_mangled_private(name)
-            || !attribute_declarations(db, literal.body_scope(db), name).any(
-                |(mut declarations, _)| {
-                    declarations.any(|declaration| declaration.declaration.definition().is_some())
-                },
-            )
+            || !super::has_own_instance_declaration(db, literal.body_scope(db), name)
         {
             continue;
         }
@@ -645,6 +647,7 @@ fn already_inherited<'db>(
     target_owner: ClassType<'db>,
     name: &str,
     source: &AttributeContract<'db>,
+    kind: AttributeContractKind,
 ) -> bool {
     let child_receiver = Type::instance(db, env, class);
     class
@@ -662,7 +665,8 @@ fn already_inherited<'db>(
             else {
                 return false;
             };
-            let Some(inherited) = attribute_contract(db, env, owner, child_receiver, name) else {
+            let Some(inherited) = attribute_contract(db, env, owner, child_receiver, name, kind)
+            else {
                 return false;
             };
             if inherited.read != source.read
@@ -673,7 +677,7 @@ fn already_inherited<'db>(
                 return false;
             }
             let receiver = Type::instance(db, env, parent);
-            let Some(inherited) = attribute_contract(db, env, owner, receiver, name) else {
+            let Some(inherited) = attribute_contract(db, env, owner, receiver, name, kind) else {
                 return false;
             };
             parent
@@ -683,7 +687,8 @@ fn already_inherited<'db>(
                 .chain(parent.iter_explicit_ancestors(db, env).skip(1))
                 .filter(|ancestor| ancestor.class_literal(db) == target_owner.class_literal(db))
                 .any(|ancestor| {
-                    let Some(target) = attribute_contract(db, env, ancestor, receiver, name) else {
+                    let Some(target) = attribute_contract(db, env, ancestor, receiver, name, kind)
+                    else {
                         return false;
                     };
                     attribute_violation(
@@ -725,11 +730,12 @@ pub(super) fn check_inherited_conflict<'db>(
     let db = context.db();
     let env = &context.program_environment();
     let receiver = Type::instance(db, env, class_type);
-    let Some(source) = attribute_contract(db, env, owner, receiver, name) else {
+    let kind = AttributeContractKind::Inherited;
+    let Some(source) = attribute_contract(db, env, owner, receiver, name, kind) else {
         return;
     };
     for target_owner in contracts.iter().copied().filter(|target| *target != owner) {
-        let Some(target) = attribute_contract(db, env, target_owner, receiver, name) else {
+        let Some(target) = attribute_contract(db, env, target_owner, receiver, name, kind) else {
             continue;
         };
         let Some(violation) = attribute_violation(
@@ -743,16 +749,10 @@ pub(super) fn check_inherited_conflict<'db>(
         ) else {
             continue;
         };
-        if already_inherited(db, env, class_type, target_owner, name, &source) {
+        if already_inherited(db, env, class_type, target_owner, name, &source, kind) {
             continue;
         }
-        let rule = if source.is_property || target.is_property {
-            &INVALID_PROPERTY_TYPE_OVERRIDE
-        } else if matches!(violation, AttributeViolation::Write { .. }) {
-            &INVALID_MUTABLE_OVERRIDE
-        } else {
-            &INVALID_ATTRIBUTE_OVERRIDE
-        };
+        let rule = violation.rule(source.is_property || target.is_property);
         let Some(builder) = context.report_lint(rule, class.header_range(db)) else {
             continue;
         };
